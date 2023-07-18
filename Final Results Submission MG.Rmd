@@ -1,0 +1,720 @@
+---
+title: "Coding and Results"
+author: "McKenzie"
+date: "2023-07-18"
+output:
+  word_document: default
+  html_document: default
+---
+
+##CLEANING 
+
+*Loading Packages*
+```{r,include=FALSE,echo=FALSE}
+##libraries
+library(SmartEDA)
+library(tidygeocoder)
+library(dplyr)
+library(xts) #Load package
+library(sf)
+library(ggplot2)
+library(tidyverse)
+library(forecast)
+library(rvest)
+library(trend)
+library(lubridate)
+library(tseries)
+library(TTR)
+```
+
+
+* The shelter data is being pulled from the city of Toronto's [Daily Shelter & Overnight Service Occuapncy & Capacity](https://open.toronto.ca/dataset/daily-shelter-overnight-service-occupancy-capacity/) dataset on Toronto's open portal website. 
+
+* The dataset is split into 3 files,1 for each year. For the 2023 year file, the data source is updated daily. 
+
+```{r,echo=FALSE}
+##Loading data and cleaning date field for union
+ 
+shelter2021<-read.csv('C:\\Users\\User\\Desktop\\Big Data Analytics Program\\Project\\Tentative Project Datasets\\Shelter\\Daily Shelter Occupancy\\Current\\Daily shelter overnight occupancy (2021).csv')
+shelter2021$OCCUPANCY_DATE<-as.Date(shelter2021$OCCUPANCY_DATE, format = "%y-%m-%d")
+
+shelter2022<-read.csv('C:\\Users\\User\\Desktop\\Big Data Analytics Program\\Project\\Tentative Project Datasets\\Shelter\\Daily Shelter Occupancy\\Current\\Daily shelter overnight occupancy (2022).csv')
+shelter2022$OCCUPANCY_DATE<-as.Date(shelter2022$OCCUPANCY_DATE, format = "%y-%m-%d")
+
+shelter2023<-read.csv('C:\\Users\\User\\Downloads\\Daily shelter overnight occupancy (2).csv')
+shelter2023$OCCUPANCY_DATE<-as.Date(shelter2023$OCCUPANCY_DATE, format = "%Y-%m-%d")
+
+#Union for complete dataset
+shltr<-rbind(shelter2021,shelter2022,shelter2023)
+rm(shelter2021,shelter2022,shelter2023)
+
+##Creating OVER_OCCUPIED field. Identifying programs that are over occupied exclusive of the capacity type
+##NEED TO UPDATE TO TAKE INTO CONSIDERATION SHELTERS OPERATING AT OVER CAPACITY~~~~~~~
+shltr$OVER_OCCUPIED<-ifelse(shltr$OCCUPANCY_RATE_ROOMS==100|shltr$OCCUPANCY_RATE_BEDS==100,1,0)
+shltr$OVER_OCCUPIED<-ifelse(is.na(shltr$OVER_OCCUPIED)==TRUE,0,1)
+
+##Creating ADDRESS field. It is a program's full address. 
+shltr$ADDRESS<-paste(shltr$LOCATION_ADDRESS,shltr$LOCATION_CITY,shltr$LOCATION_PROVINCE)
+
+##OCCUPANCY_RATES. Creating one field for occupancy rates inclusive of capacity type
+shltr$OCCUPANCY_RATE<-ifelse(is.na(shltr$OCCUPANCY_RATE_BEDS),shltr$OCCUPANCY_RATE_ROOMS,shltr$OCCUPANCY_RATE_BEDS)
+
+##Drop redundant fields
+shltr<-shltr[,c(1:20,33,34,35)]
+
+
+```
+
+
+*Dealing with Missing Values*
+
+```{r,echo=FALSE}
+ExpData(shltr,type=2)
+```
+
+* The proportion of missing values is very small. Most of the missing values are for fields related to location. Since the fields that contain missing values are non-numerical I am going to convert all missing values to "unknown". 
+
+```{r,echo=FALSE}
+#any missing values for measures? 
+anyNA(shltr$OCCUPANCY_RATE)
+anyNA(shltr$OVER_OCCUPIED)
+```
+
+```{r,echo=FALSE}
+#The only instances of missing values appear as blanks in location related fields. I am turning all blanks to NAs 
+shltr[shltr==""]<-"Unknown"
+shltr[is.na(shltr)]<-"Unknown"
+```
+
+
+```{r,echo=FALSE}
+#Need to trim leading white spaces from city field
+shltr$LOCATION_CITY<-trimws(shltr$LOCATION_CITY)
+
+```
+
+*Additional geographic information*
+
+* Part of my analysis will involve understanding shelter related metrics across different neighborhood. 
+
+* The following code brings in location related characteristics. The [census tract boundary file](https://www12.statcan.gc.ca/census-recensement/alternative_alternatif.cfm?l=eng&dispext=zip&teng=lct_000b21a_e.zip&k=%20%20%20%2013089&loc=//www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/files-fichiers/lct_000b21a_e.zip) comes from statistics Canada and the city of Toronto's [Neighbourhood file.](https://open.toronto.ca/dataset/neighbourhoods/)
+
+```{r,echo=FALSE}
+
+##Creating a list of addresses for each shelter program. These addresses will be used to bring Census tract/neighbourhoods for each program. 
+Addresses<-as.data.frame(unique(paste(shltr$LOCATION_ADDRESS,shltr$LOCATION_CITY,shltr$LOCATION_PROVINCE)))
+#Cleaning Column Name
+colnames(Addresses)<-'Addresses'
+
+#Using the tidygeocoder package to bring in lat and longs to each address for neighbourhood identification
+lat_longs<-Addresses %>% 
+  geocode(Addresses)
+#Removing postal codes that did not return a lat/long
+lat_longs<-lat_longs %>%
+  filter(is.na(lat)==FALSE & lat_longs$Addresses!='')
+#Create a point geometric field using the st package
+lat_longs<-lat_longs %>% st_as_sf(coords=c('long','lat'))
+lat_longs<-st_set_crs(lat_longs,4326)
+
+#Raading the census tract boundary file from statistics canada. 
+# Provide the link 
+
+CT<-read_sf("C:\\Users\\User\\Desktop\\CTest\\lct_000a21a_e.shp")
+#Filter for Ontario Province
+CT<-CT %>% filter(PRUID=='35')
+CT<-st_transform(CT,crs=4326)
+
+#Toronto Neighbourhoods Profile. To identify a Toronto Neighbourhood map geometric point to the boundary file found on toronto open data portal
+TNei<-read_sf('C:\\Users\\User\\Desktop\\Big Data Analytics Program\\Project\\Tentative Project Datasets\\Neighbourhoods\\Boundary File\\Neighbourhoods - 4326.shp')
+#Table identifying each CT Id for each shelter
+TorCTs<-st_join(lat_longs,CT)
+
+#Decide which fields to keep, bring neighbourhood information to address data source
+TorCTs<-st_join(TorCTs,TNei)
+TorCTsMap<-TorCTs
+TorCTs<-TorCTs[,c(1,15,16)]
+
+##Bring Neighbourhood information to the shltr data set. 
+shltr<-left_join(shltr,TorCTs,by=c('ADDRESS' ='Addresses'))
+colnames(shltr)[c(24,25)]<-c('Neighbourhood','Improv_Status_Area')
+
+
+##Adding in weekday
+shltr$WeekDay<-weekdays(shltr$OCCUPANCY_DATE)
+shltr$Month<-format(shltr$OCCUPANCY_DATE,'%b')
+shltr$ShltrSize<-round(shltr$SERVICE_USER_COUNT/(shltr$OCCUPANCY_RATE/100),digits = 0)
+```
+
+
+**Creating Measures of Interest** 
+
+```{r,echo=FALSE}
+#Defining the index for time for the time series object
+minDate<-min(shltr$OCCUPANCY_DATE)
+maxDate<-max(shltr$OCCUPANCY_DATE)
+indy<-seq(minDate,maxDate,by='day')
+```
+
+*Creating measures* 
+
+* Note all of these measures were used in the analysis. 
+```{r, echo=FALSE}
+##Daily Intakes Aggregated for the Toronto Region. 
+NTakeShltr<-aggregate(SERVICE_USER_COUNT ~ OCCUPANCY_DATE ,data=shltr,FUN=sum)
+colnames(NTakeShltr)[2]<-'TotalUsers'
+##Creating xts(time series) object
+NTakeShltrVec<-NTakeShltr$TotalUsers
+xtsNTakeShltr<-xts(NTakeShltrVec,order.by = indy)
+colnames(xtsNTakeShltr)<-'Total_Intakes'
+rm(NTakeShltrVec)
+
+##Daily Count of programs operating
+OpenShltr<-aggregate(PROGRAM_ID ~ OCCUPANCY_DATE ,data=shltr,FUN=length)
+colnames(OpenShltr)[2]<-'TotalOpenPrograms'
+#xts object
+OpenShltrVec<-OpenShltr$TotalOpenPrograms
+xtsOpenShltr<-xts(OpenShltrVec,order.by=indy)
+colnames(xtsOpenShltr)<-'TotalOpenPrograms'
+rm(OpenShltrVec)
+
+##Over Capacity Programs
+OverCapShltr<-aggregate(OVER_OCCUPIED ~ OCCUPANCY_DATE ,data=shltr,FUN=sum)
+colnames(OverCapShltr)[2]<-'TotalOverCapacityShltrs'
+#xts object
+OverCapShltrVec<-OverCapShltr$TotalOverCapacityShltrs
+xtsOverCapShltr<-xts(OverCapShltrVec,order.by = indy)
+colnames(xtsOverCapShltr)<-'TotalOverCapacityShltrs'
+rm(OverCapShltrVec)
+
+#Proportion of shltrs operating at over capacity
+OverCapPropShltr<-left_join(OpenShltr,OverCapShltr,by = 'OCCUPANCY_DATE')
+OverCapPropShltr$OverCapRate<-round((OverCapPropShltr$TotalOverCapacityShltrs/OverCapPropShltr$TotalOpenPrograms)*100,digits = 2)
+OverCapPropShltr<-OverCapPropShltr[,c(1,4)]
+#xts object
+OverCapPropShltrVec<-OverCapPropShltr$OverCapRate
+xtsOverCapPropShltr<-xts(OverCapPropShltrVec,order.by = indy)
+colnames(xtsOverCapPropShltr)<-'OverCapRate'
+
+##Average Capacity Rate
+AvgOccPerShltr<-aggregate(OCCUPANCY_RATE ~ OCCUPANCY_DATE,data=shltr,FUN=mean)
+AvgOccPerShltr$OCCUPANCY_RATE<-round(AvgOccPerShltr$OCCUPANCY_RATE,digits = 2)
+AvgOccPerShltr$OccupancyRate<-NULL
+#xts object
+AvgOccPerShltrVec<-AvgOccPerShltr$OCCUPANCY_RATE
+xtsAvgOccPerShltr<-xts(AvgOccPerShltrVec,order.by = indy)
+colnames(xtsAvgOccPerShltr)<-'OCCUPANCY_RATE'
+
+##Average Size of shelter programs
+AvgShltrSze<-aggregate(shltr$ShltrSize ~ OCCUPANCY_DATE ,data=shltr,FUN=mean)
+```
+
+##Neighbourhood Improvement Area
+
+```{r,echo=FALSE}
+#Clean Neighbourhood improvement area column
+unique(shltr$Improv_Status_Area)
+shltr$Improv_Status_Area<-ifelse(shltr$Improv_Status_Area!='Neighbourhood Improvement Area' | is.na(shltr$Improv_Status_Area)==TRUE ,'Not Improvment Area','Neighbourhood Improvement Area')
+
+###Aggregate on improvement area and occupancy date to get the daily mean occupancy rate, total programs operating and total programs that hit capacity
+ImprAvgCap<- shltr %>%
+  group_by(OCCUPANCY_DATE, Improv_Status_Area) %>% 
+  summarise(AVG_CAPACITY = mean(OCCUPANCY_RATE),
+            TotalProgrms = n(),
+            Hit_Capacity = sum(OVER_OCCUPIED))
+##Getting the proportion of shelters at or over capacity.
+ImprAvgCap$OverCapacityRate <- round((ImprAvgCap$Hit_Capacity / ImprAvgCap$TotalProgrms)*100,digits = 2)
+```
+
+```{r}
+
+##Creating line graph for average daily capacity rates by neighbourhood improvement area
+ggplot(ImprAvgCap,aes(x=as.Date(OCCUPANCY_DATE), y=AVG_CAPACITY,color=Improv_Status_Area ))+
+  geom_line()+
+  labs(x='Date', y='Daily Average Capacity Rate', color='Improvement_area_status')+
+  facet_wrap(~Improv_Status_Area,ncol = 1);
+
+##Creating a line graph for the proportion of shelters operating at or over capacity
+ggplot(ImprAvgCap,aes(x=as.Date(OCCUPANCY_DATE), y=OverCapacityRate,color=Improv_Status_Area ))+
+  geom_line()+
+  labs(x='Date', y='Daily Average OVer Capacity Rate', color='Improvement_area_status')+
+  facet_wrap(~Improv_Status_Area,ncol = 1)
+
+```
+
+```{r}
+##Aggregating to get the average of the average capacity rates for neighbourhood improvement areas and the average proporiton of shelters operating at or over capacity
+ImprOverallAvgCap<-ImprAvgCap %>%
+  group_by(Improv_Status_Area) %>%
+  summarise(AVG_CAPACITY = round(mean(AVG_CAPACITY),digits=2),
+            AVG_OVER_CAPACITY_RATE = round(mean(OverCapacityRate),digits = 2))
+
+##Creating a barchart to compare averages
+ggplot(ImprOverallAvgCap,aes(x=Improv_Status_Area, y=AVG_CAPACITY,fill=Improv_Status_Area ))+
+  geom_bar(stat='identity')+
+  theme(axis.text = element_text(angle=90, hjust=1))+
+  geom_text(aes(label = AVG_CAPACITY),vjust=1.5,color='black')+
+  labs(title = 'Average Capacity Rate',x='Improvement Area Status',color = 'Improvement Area Status');
+  
+ggplot(ImprOverallAvgCap,aes(x=Improv_Status_Area, y=AVG_OVER_CAPACITY_RATE,fill=Improv_Status_Area ))+
+  geom_bar(stat='identity')+
+  theme(axis.text = element_text(angle=90, hjust=1))+
+  geom_text(aes(label = AVG_OVER_CAPACITY_RATE),vjust=1.5,color='black')+
+  labs(title = 'Average Over Capacity Rate',x='Improvement Area Status',color = 'Improvement Area Status')
+```
+
+
+```{r}
+##Kruskal Wallis test 
+###Test for comparing average capacity rates
+kruskal.test(AVG_CAPACITY ~ Improv_Status_Area,data=ImprAvgCap)
+##Test for comparing the average of proportion of shelters operating at or over capacity. 
+kruskal.test(OverCapacityRate ~ Improv_Status_Area ,data=ImprAvgCap)
+```
+
+## Average Capacity Rate Trend**
+
+```{r,echo=FALSE}
+# Convert the xts object to a data frame
+AvgOccPerShltrPlt <- data.frame(Date = index(xtsAvgOccPerShltr), Value = coredata(xtsAvgOccPerShltr))
+#Creating label to identify dates where we see the maximum shelter intakes
+max_date <- index(xtsAvgOccPerShltr)[which.max(coredata(xtsAvgOccPerShltr))]
+#Creating label to identify dates where we see the minimum shelter intakes
+min_date <- index(xtsAvgOccPerShltr)[which.min(coredata(xtsAvgOccPerShltr))]
+
+# Create the plot
+ggplot(data = AvgOccPerShltrPlt, aes(x = Date, y = OCCUPANCY_RATE)) +
+  geom_line()+
+#Adding max and min label dates  
+  geom_text(data = subset(AvgOccPerShltrPlt, Date %in% c(max_date, min_date)),
+            aes(label = as.character(Date), vjust = ifelse(Date == max_date, -0.5, 0.5)),
+            show.legend = FALSE)+
+#Adding points to id min and max dates  
+  geom_point(data = subset(AvgOccPerShltrPlt, Date %in% c(max_date, min_date)),
+             aes(color = ifelse(Date == max_date, "blue",'red')),
+             size = 3)+
+  labs(title = "Average Daily Shelter Capacity Rates") +
+  xlab("Date") +
+  ylab("Value")+
+  theme(legend.position = 'none');plot.ts(SMA(xtsAvgOccPerShltr$OCCUPANCY_RATE,n=5))
+
+```
+
+
+
+|Metric|Daily Capacity Rate|
+|--------|------------|
+|Mean|`r round(mean(xtsAvgOccPerShltr),digits=2)`|
+|Median |`r round(median(xtsAvgOccPerShltr),digits=2)` |
+|Standard Deviation|`r round(sd(xtsAvgOccPerShltr),digits=2)`|
+|Minimum|`r round(min(xtsAvgOccPerShltr),digits=2)`|
+|Maximum|`r round(max(xtsAvgOccPerShltr),digits=2)`|
+|Range |`r round(min(xtsAvgOccPerShltr),digits=2)` - `r round(max(xtsAvgOccPerShltr),digits=2)`|
+
+**Capacity Rate Distribution**
+
+```{r,echo=FALSE}
+ggplot(xtsAvgOccPerShltr,
+       aes(sample=OCCUPANCY_RATE))+
+  geom_qq()+
+  geom_qq_line()
+
+```
+**ACF PLOT for Average Daily Capacity Rates**
+
+```{r,echo=FALSE}
+acf(ts(xtsAvgOccPerShltr))
+```
+
+**Differenced plot**
+
+```{r,echo=FALSE}
+plot.ts(diff(xtsAvgOccPerShltr))
+```
+
+**Average Daily Capacity Rate: Stationairy** 
+
+```{r,echo=FALSE}
+kpss.test(ts(xtsAvgOccPerShltr))##KPSS TEST
+adf.test(ts(xtsAvgOccPerShltr))##ADF TEST
+```
+
+**Average Capacity RAte: Trend Assessment**
+
+```{r,echo=FALSE}
+mkAvgOccShlter<-mk.test(ts(xtsAvgOccPerShltr$OCCUPANCY_RATE))
+print(mkAvgOccShlter)
+snsAvgOccShltr<-sens.slope(ts(xtsAvgOccPerShltr$OCCUPANCY_RATE))
+print(snsAvgOccShltr)
+```
+
+
+### Capacity Rate Forcasting
+
+```{r,echo=FALSE}
+##Creating test and training sets.
+#For forecasting I will convert my xts object to a ts object. 
+tsAvgOccPerShltr<-ts(xtsAvgOccPerShltr)
+##Training set is all the dates in the time series except the last 30 days (a month)
+trnAvgOccPerShltr<-window(tsAvgOccPerShltr,end = end(index(tsAvgOccPerShltr)[1:(nrow(tsAvgOccPerShltr)-31)]))
+##Test
+tstAvgOccPerShltr<-window(tsAvgOccPerShltr,start=c(end(tsAvgOccPerShltr)[1] - 30, end(tsAvgOccPerShltr)[2]))
+
+```
+
+```{r,echo=FALSE}
+#Naive Test
+fcNaiAvgOcc<-naive(trnAvgOccPerShltr,h=30)
+autoplot(fcNaiAvgOcc)+
+  autolayer(tstAvgOccPerShltr,series='Test Date')
+```
+
+```{r,echo=FALSE}
+##Random walk with drift
+fcRwdAvgOcc<-rwf(trnAvgOccPerShltr,h=30,drift=TRUE)
+autoplot(fcRwdAvgOcc)+
+  autolayer(tstAvgOccPerShltr,series='Random Walk With Drift')
+```
+
+```{r,echo=FALSE}
+#Simple Exponential Smoothing 
+fcSesAvgOcc<-ses(trnAvgOccPerShltr,h=30)
+autoplot(fcSesAvgOcc)+
+  autolayer(tstAvgOccPerShltr,series = "SES Test")
+forecast(fcSesAvgOcc,h=30)
+```
+
+```{r,echo=FALSE}
+##ARIMA
+ArAvgOcc<-auto.arima(trnAvgOccPerShltr)
+fcArAvgOcc<-forecast(ArAvgOcc,h=31)
+autoplot(fcArAvgOcc)+
+  autolayer(tstAvgOccPerShltr,series='ARIMA Test')
+```
+
+
+##Evaluating Model Performance: Capacity RAte
+
+```{r,echo=FALSE}
+##Pulling MAPE Valeus and assigning to vectors
+MapeARMAvgOCC<-accuracy(fcArAvgOcc,tstAvgOccPerShltr)[2,5]
+MapeSesAvgOCC<-accuracy(fcSesAvgOcc,tstAvgOccPerShltr)[2,5]
+MapeNaiAvgOcc<-accuracy(fcNaiAvgOcc,tstAvgOccPerShltr)[2,5]
+MapeRWDAvgOCC<-accuracy(fcRwdAvgOcc,tstAvgOccPerShltr)[2,5]
+
+MapeValues<-c(round(MapeARMAvgOCC,digits = 3),round(MapeSesAvgOCC,digits = 3) ,round(MapeNaiAvgOcc,digits = 3),round(MapeRWDAvgOCC,digits = 3))
+#Barplot to compare 
+barplot(MapeValues,names.arg = c('ARIMA','SES','Naive','Random Walk With Drift'))
+text(x=1:length(MapeValues),y=MapeValues,labels = MapeValues,pos=1)
+
+```
+
+**Checking Risduals**
+```{r,echo=FALSE}
+checkresiduals(fcArAvgOcc)
+```
+
+###Trend Segmentation: Average Capacity Rate
+
+
+```{r,echo=FALSE}
+##Creating time series set just for after the peak
+AftrPeak<-xtsAvgOccPerShltr[index(xtsAvgOccPerShltr)>index(xtsAvgOccPerShltr)[which.max(coredata(xtsAvgOccPerShltr))],]
+plot.ts(AftrPeak)
+```
+**Distribution of Capacity Rate After PEak** 
+```{r}
+qplot(AftrPeak)
+```
+
+**After Peak: Stationary Test**
+
+```{r,echo=FALSE}
+mk.test(ts(AftrPeak))
+```
+
+
+```{r,echo=FALSE}
+kpss.test(ts(AftrPeak));adf.test(ts(AftrPeak))
+```
+
+
+###Proportion of shelters operating at or over capacity
+
+```{r,echo=FALSE}
+# Convert the xts object to a data frame
+OverCapPropShltrPlt <- data.frame(Date = index(xtsOverCapPropShltr), Value = coredata(xtsOverCapPropShltr))
+#Creating label to identify dates where we see the maximum shelter intakes
+max_date <- index(xtsOverCapPropShltr)[which.max(coredata(xtsOverCapPropShltr))]
+#Creating label to identify dates where we see the minimum shelter intakes
+min_date <- index(xtsOverCapPropShltr)[which.min(coredata(xtsOverCapPropShltr))]
+
+# Create the plot
+ggplot(data = OverCapPropShltrPlt, aes(x = Date, y = OverCapRate)) +
+  geom_line()+
+#Adding max and min label dates  
+  geom_text(data = subset(OverCapPropShltrPlt , Date %in% c(max_date, min_date)),
+            aes(label = as.character(Date), vjust = ifelse(Date == max_date, -0.5, 0.5)),
+            show.legend = FALSE)+
+#Adding points to id min and max dates  
+  geom_point(data = subset(OverCapPropShltrPlt , Date %in% c(max_date, min_date)),
+             aes(color = ifelse(Date == max_date, "blue",'red')),
+             size = 3)+
+  labs(title = "% of Shelters at or over Capacity") +
+  xlab("Date") +
+  ylab("Value")+
+  theme(legend.position = 'none');plot.ts(SMA(xtsOverCapPropShltr,n=5))
+```
+
+
+**Distribution: At or Over Capacity**
+
+```{r,echo=FALSE}
+ggplot(xtsOverCapPropShltr,
+       aes(sample=OverCapRate))+
+  geom_qq()+
+  geom_qq_line()
+```
+
+
+**ACF PLOT: At or Over Capacity Rate**
+
+```{r,echo=FALSE}
+acf(ts(xtsOverCapPropShltr))
+```
+
+**Stationary Assessment: At or Over Capacity** 
+
+```{r,echo=FALSE}
+kpss.test(ts(xtsOverCapPropShltr))##KPSS TEST
+adf.test(ts(xtsOverCapPropShltr)) ##ADF TEST
+```
+
+**Trend Assessment: At or Over Capacity**
+
+```{r,echo=FALSE}
+mkOverCapPropShltr<-mk.test(ts(xtsOverCapPropShltr))
+print(mkOverCapPropShltr)
+snsOverCapPropShltr<-sens.slope(ts(xtsOverCapPropShltr$OverCapRate))
+print(snsOverCapPropShltr)
+```
+
+**Forecasting: At or Over Capacity**
+
+```{r,echo=FALSE}
+##Creating test and training sets.
+#For forecasting I will convert my xts object to a ts object. 
+tsOverCapPropShltr<-ts(xtsOverCapPropShltr)
+##Training is all the dates in the time series except the last 30 days (a month)
+trnOverCapPropShltr<-window(tsOverCapPropShltr,end = end(index(tsOverCapPropShltr)[1:(nrow(tsOverCapPropShltr)-31)]))
+##Test
+tstOverCapPropShltr<-window(tsOverCapPropShltr,start=c(end(tsOverCapPropShltr)[1] - 30, end(tsOverCapPropShltr)[2]))
+```
+
+```{r,echo=FALSE}
+#Naive Test
+fcNaiOverCap<-naive(trnOverCapPropShltr,h=30)
+autoplot(fcNaiOverCap)+
+  autolayer(tstOverCapPropShltr,series='Test Date')
+```
+
+```{r,echo=FALSE}
+##Random walk with drift
+fcRwdOverCap<-rwf(trnOverCapPropShltr,h=30,drift=TRUE)
+autoplot(fcRwdOverCap)+
+  autolayer(tstOverCapPropShltr,series='Random Walk With Drift')
+```
+
+```{r,echo=FALSE}
+#Simple Exponential Smoothing 
+fcSesOverCap<-ses(trnOverCapPropShltr,h=30)
+autoplot(fcSesOverCap)+
+  autolayer(tstOverCapPropShltr,series = "SES Test")
+
+```
+
+```{r,echo=FALSE}
+#ARIMA
+ArOverCap<-auto.arima(trnOverCapPropShltr)
+fcArOverCap<-forecast(ArOverCap,h=31)
+autoplot(fcArOverCap)+
+  autolayer(tstOverCapPropShltr,series='ARIMA Test')
+
+```
+
+**Evaluating Model Performance: At or Over Capacity**
+
+```{r,echo=FALSE}
+##Pulling MAPE values
+MapeARMOverCap<-accuracy(fcArOverCap,tstOverCapPropShltr)[2,5]
+MapeSesOverCap<-accuracy(fcSesOverCap,tstOverCapPropShltr)[2,5]
+MapeNaiOverCap<-accuracy(fcNaiOverCap,tstOverCapPropShltr)[2,5]
+MapeRWDOverCap<-accuracy(fcRwdOverCap,tstOverCapPropShltr)[2,5]
+
+MapeValues<-c(round(MapeARMOverCap,digits = 3),round(MapeSesOverCap,digits = 3) ,round(MapeNaiOverCap ,digits = 3),round(MapeRWDOverCap ,digits = 3))
+
+barplot(MapeValues,names.arg = c('ARIMA','SES','Naive','Random Walk With Drift'))
+text(x=1:length(MapeValues),y=MapeValues,labels = MapeValues,pos=1)
+
+```
+
+**Residuals: At or Over Capacity**
+
+```{r,echo=FALSE}
+checkresiduals(fcArOverCap)
+```
+
+
+**Correlation: Capacity Rate ~ Over Capacity**
+
+```{r,echo=FALSE}
+plot(as.vector(xtsAvgOccPerShltr$OCCUPANCY_RATE), as.vector(xtsOverCapPropShltr$OverCapRate))
+```
+```{r,echo=FALSE}
+cor(as.vector(xtsAvgOccPerShltr$OCCUPANCY_RATE), as.vector(xtsOverCapPropShltr$OverCapRate),method = 'pearson' )
+```
+
+
+##Refugee Programs: Capacity Rate
+
+**Looking at those more susceptible to homelessness** 
+
+# Creating Refugee identification column
+```{r,echo=FALSE}
+shltr$RfugPrgm<-ifelse(grepl('Refugee',shltr$PROGRAM_NAME)|shltr$PROGRAM_AREA=='Temporary Refugee Response' ,'Refugee','Other')
+```
+
+**Trend: Refugee Programs vs non-refugee programs**
+
+```{r,echo=FALSE}
+RefuAvgOcc<-shltr %>%
+  group_by(OCCUPANCY_DATE,RfugPrgm) %>%
+  summarise(AVG_CAPACITY = mean(OCCUPANCY_RATE),
+            Programs = n(),
+            AverageNTakes = mean(SERVICE_USER_COUNT),
+            WeightedAvgUsers = weighted.mean(SERVICE_USER_COUNT,ShltrSize),
+            WeightAvgOcc =weighted.mean(OCCUPANCY_RATE,ShltrSize),
+            TotalUsers = sum(SERVICE_USER_COUNT))
+
+ggplot(RefuAvgOcc,aes(x=as.Date(OCCUPANCY_DATE),y=AVG_CAPACITY))+
+  geom_line()+
+  facet_wrap(~RfugPrgm)
+
+```
+
+**Testing Averages**
+
+```{r,echo=FALSE}
+AvgOccRefug<- RefuAvgOcc %>% filter(RfugPrgm=='Refugee')
+xtsAvgOccRefug<-xts(x=AvgOccRefug$AVG_CAPACITY,order.by = AvgOccRefug$OCCUPANCY_DATE)
+AvgOccOthr<- RefuAvgOcc %>% filter(RfugPrgm!='Refugee')
+xtsAvgOccOthr<-xts(x=AvgOccOthr$AVG_CAPACITY,order.by = AvgOccOthr$OCCUPANCY_DATE)
+```
+
+```{r,echo=FALSE}
+wilcox.test(as.vector(AvgOccRefug$AVG_CAPACITY),as.vector(AvgOccOthr$AVG_CAPACITY))
+```
+
+
+**Correlation between refugee programs and other programs**
+```{r,echo=FALSE}
+plot(as.vector(xtsAvgOccRefug), as.vector(xtsAvgOccOthr))
+cor(as.vector(xtsAvgOccRefug), as.vector(xtsAvgOccOthr),method = 'pearson' )
+```
+
+**Differenced plots in refugee capacity rates and other programs**
+```{r,echo=FALSE}
+plot.ts(diff(xtsAvgOccOthr));plot.ts(diff(xtsAvgOccRefug))
+
+```
+
+**ACF PLOTS: Refugee and non-refugee programs**
+
+```{r,echo=FALSE}
+acf(ts(xtsAvgOccRefug));acf(ts(xtsAvgOccOthr))
+```
+
+**Stationary assessment: Refugee programs**
+
+```{r,echo=FALSE}
+kpss.test(ts(xtsAvgOccRefug))
+adf.test(ts(xtsAvgOccRefug))
+```
+
+**Trend Assessment: Refugee Programs**
+
+```{r,echo=FALSE}
+mkAvgOccRefug<-mk.test(ts(xtsAvgOccRefug))
+print(mkAvgOccRefug)
+snsAvgOccRefug<-sens.slope(ts(xtsAvgOccRefug))
+print(snsAvgOccRefug)
+
+```
+
+
+**Forecasting: Refugee Programs** 
+
+```{r,echo=FALSE}
+##Creating test and training sets.
+#For forecasting I will convert my xts object to a ts object. 
+tsAvgOccRefug<-ts(xtsAvgOccRefug)
+##Training is all the dates in the time series except the last 30 days (a month)
+trnAvgOccRefug<-window(tsAvgOccRefug,end = end(index(tsAvgOccRefug)[1:(nrow(tsAvgOccRefug)-31)]))
+##Test
+tstAvgOccRefug<-window(tsAvgOccRefug,start=c(end(tsAvgOccRefug)[1] - 30, end(tsAvgOccRefug)[2]))
+```
+
+```{r}
+#Naive Test
+fcNaiAvgOccRefug<-naive(trnAvgOccRefug,h=30)
+autoplot(fcNaiAvgOccRefug)+
+  autolayer(tstAvgOccRefug,series='Test Date')
+```
+
+```{r,echo=FALSE}
+##Random walk with drift
+fcRwdAvgOccRefug<-rwf(trnAvgOccRefug,h=30,drift=TRUE)
+autoplot(fcRwdAvgOccRefug)+
+  autolayer(tstAvgOccRefug,series='Random Walk With Drift')
+```
+
+```{r,echo=FALSE}
+#Simple Exponential Smoothing 
+fcSesAvgOccRefug<-ses(trnAvgOccRefug,h=30)
+autoplot(fcSesAvgOccRefug)+
+  autolayer(tstAvgOccRefug,series = "SES Test")
+
+```
+
+
+```{r,echo=FALSE}
+##ARIMA
+ArAvgOccRefug<-auto.arima(trnAvgOccRefug)
+fcArAvgOccRefug<-forecast(ArAvgOccRefug,h=31)
+autoplot(fcArAvgOccRefug)+
+  autolayer(tstAvgOccRefug,series='ARIMA Test')
+
+```
+
+**Evaluating Model Performance: Refugee Capacity Rates**
+
+```{r,echo=FALSE}
+MapeARMOverCap<-accuracy(fcArAvgOccRefug,tstAvgOccRefug)[2,5]
+MapeSesOverCap<-accuracy(fcSesAvgOccRefug,tstAvgOccRefug)[2,5]
+MapeNaiOverCap<-accuracy(fcNaiAvgOccRefug, tstAvgOccRefug)[2,5]
+MapeRWDOverCap<-accuracy(fcRwdAvgOccRefug,tstAvgOccRefug)[2,5]
+
+MapeValues<-c(round(MapeARMOverCap,digits = 3),round(MapeSesOverCap,digits = 3) ,round(MapeNaiOverCap ,digits = 3),round(MapeRWDOverCap ,digits = 3))
+
+barplot(MapeValues,names.arg = c('ARIMA','SES','Naive','Random Walk With Drift'))
+text(x=1:length(MapeValues),y=MapeValues,labels = MapeValues,pos=1)
+```
+
+```{r,echo=FALSE}
+checkresiduals(fcRwdAvgOccRefug)
+
+```
+
+
+
+
+
